@@ -10,6 +10,7 @@ import { Milestone, Project, Proposal } from '@/types';
 import { ImageLightboxModal } from './ImageLightboxModal';
 import { ProjectChatModal } from './ProjectChatModal';
 import { ProjectCardSkeletonList, ProposalSkeletonList } from '@/components/skeletons';
+import { DownloadReceiptButton } from '@/components/DownloadReceiptButton';
 
 export function FreelancerDashboard() {
   const router = useRouter();
@@ -93,6 +94,7 @@ export function FreelancerDashboard() {
             >
               <span>💬 Chat with Client</span>
             </button>
+            <DownloadReceiptButton project={proj} />
             <span className={isModal 
               ? "px-5 py-2.5 bg-[#052e16] text-[#22c55e] border border-[#14532d] text-xs font-bold rounded-xl flex items-center gap-1.5 shadow-md"
               : "px-3.5 py-1.5 bg-[#052e16] text-[#22c55e] border border-[#14532d] text-xs font-bold rounded-xl flex items-center gap-1"
@@ -677,6 +679,18 @@ export function FreelancerDashboard() {
                           >
                             <span>💬 Chat with Client</span>
                           </button>
+                          <DownloadReceiptButton
+                            project={projects.find((p) => p.id === prop.project_id) || {
+                              id: prop.project_id,
+                              title: prop.project_title || 'Freelance Project',
+                              description: '',
+                              category: 'General',
+                              budget: prop.budget,
+                              status: 'in_progress',
+                              token: 'USDC',
+                            }}
+                            proposal={prop}
+                          />
                           <span className="px-3 py-1 bg-[#052e16] text-[#22c55e] border border-[#14532d] text-xs font-semibold rounded-full">
                             Granted ✓
                           </span>

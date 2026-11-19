@@ -673,6 +673,8 @@ export default function ProjectDetailsPage() {
             >
               {project.status.replace('_', ' ')}
             </span>
+
+            <CalendarExportButton project={project} />
           </div>
         </div>
 
@@ -735,6 +737,8 @@ export default function ProjectDetailsPage() {
               </span>
             </div>
           </div>
+
+          <ProjectAuditLog project={project} />
 
           {/* On-Chain Deposit Callout if project has not been locked on-chain yet */}
           {!hasOnChainEscrow && isClient && (

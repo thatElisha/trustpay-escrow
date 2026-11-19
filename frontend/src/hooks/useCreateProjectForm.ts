@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { toast } from 'sonner';
 import { projectSchema, ProjectFormData } from '@/lib/validators';
 import { z } from 'zod';
@@ -7,6 +7,105 @@ import { useRouter } from 'next/navigation';
 import { useOfflineSync, OfflineStatusPill } from '@/hooks/useOfflineSync';
 
 import { SUPPORTED_TOKENS } from '@/config/tokens';
+import { HORIZON_URL } from '@/lib/soroban';
+
+interface HorizonBalanceLine {
+  asset_type: string;
+  asset_code?: string;
+  asset_issuer?: string;
+  balance: string;
+}
+
+interface HorizonAccountResponse {
+  balances?: HorizonBalanceLine[];
+}
+
+export function getBalanceShortfall(balance: number | null, budget: number): number {
+  const requiredNumber = Number(budget);
+  const availableNumber = Number(balance);
+  const required = Number.isFinite(requiredNumber) && requiredNumber > 0 ? requiredNumber : 0;
+  const available = Number.isFinite(availableNumber) && availableNumber > 0 ? availableNumber : 0;
+  return Math.max(0, Number((required - available).toFixed(7)));
+}
+
+export function isBalanceSufficient(balance: number | null, budget: number): boolean {
+  return getBalanceShortfall(balance, budget) === 0;
+}
+
+function readTokenBalance(account: HorizonAccountResponse, token: string): number {
+  const tokenConfig = SUPPORTED_TOKENS[token];
+  const lines = account.balances || [];
+  const match = lines.find((line) => {
+    if (token === 'XLM') return line.asset_type === 'native';
+    if (tokenConfig && line.asset_issuer) {
+      return (
+        line.asset_code === tokenConfig.symbol &&
+        line.asset_issuer.toLowerCase() === tokenConfig.issuerOrContractAddress.toLowerCase()
+      );
+    }
+    return line.asset_code === token;
+  });
+  const value = match ? Number(match.balance) : 0;
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+export function useTokenBalance(address: string | null | undefined, token: string) {
+  const [balance, setBalance] = useState<number | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
+
+  const refresh = useCallback(() => setReloadKey((value) => value + 1), []);
+
+  useEffect(() => {
+    let active = true;
+    const controller = new AbortController();
+
+    async function loadBalance() {
+      if (!address) {
+        if (active) {
+          setBalance(null);
+          setError(null);
+          setLoading(false);
+        }
+        return;
+      }
+
+      setLoading(true);
+      setError(null);
+      try {
+        const response = await fetch(`${HORIZON_URL}/accounts/${encodeURIComponent(address)}`, {
+          signal: controller.signal,
+        });
+        if (response.status === 404) {
+          if (active) setBalance(0);
+          return;
+        }
+        if (!response.ok) {
+          throw new Error(`Balance lookup failed (${response.status})`);
+        }
+        const account = (await response.json()) as HorizonAccountResponse;
+        if (active) setBalance(readTokenBalance(account, token));
+      } catch (err) {
+        if (controller.signal.aborted) return;
+        if (active) {
+          setBalance(null);
+          setError(err instanceof Error ? err.message : 'Could not load wallet balance');
+        }
+      } finally {
+        if (active) setLoading(false);
+      }
+    }
+
+    void loadBalance();
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [address, token, reloadKey]);
+
+  return { balance, loading, error, refresh };
+}
 
 export function useCreateProjectForm() {
   const router = useRouter();
@@ -41,6 +140,9 @@ export function useCreateProjectForm() {
     yield_enabled: false,
     estimated_yield: 0,
   });
+  const walletBalance = useTokenBalance(address, formData.token);
+  const balanceShortfall = getBalanceShortfall(walletBalance.balance, formData.budget);
+  const hasSufficientBalance = isBalanceSufficient(walletBalance.balance, formData.budget);
 
   // Restore draft from IndexedDB on initial mount
   useEffect(() => {
@@ -145,6 +247,13 @@ export function useCreateProjectForm() {
       return;
     }
 
+    if (walletBalance.balance !== null && balanceShortfall > 0) {
+      toast.error(
+        `Insufficient ${formData.token} balance. You need ${balanceShortfall.toLocaleString()} more ${formData.token}.`
+      );
+      return;
+    }
+
     setLoading(true);
 
     // If offline, queue request for automatic sync on reconnect
@@ -228,7 +337,13 @@ export function useCreateProjectForm() {
     handleChange,
     toggleYield,
     handleFileUploadMock,
-    handleSubmit
+    handleSubmit,
+    walletBalance: walletBalance.balance,
+    balanceLoading: walletBalance.loading,
+    balanceError: walletBalance.error,
+    balanceShortfall,
+    hasSufficientBalance,
+    refreshBalance: walletBalance.refresh,
   };
 }
 
