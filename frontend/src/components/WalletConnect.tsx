@@ -51,6 +51,17 @@ export default function WalletConnect() {
   const [tempSignedXdr, setTempSignedXdr] = useState('');
   const [copied, setCopied] = useState(false);
   const [mounted, setMounted] = useState(false);
+  const emailDialogRef = useFocusTrap<HTMLDivElement>({
+    active: showEmailModal,
+    onEscape: () => {
+      setShowEmailModal(false);
+      setIsConnecting(false);
+    },
+  });
+  const xBullDialogRef = useFocusTrap<HTMLDivElement>({
+    active: showXBullModal,
+    onEscape: () => setShowXBullModal(false),
+  });
   const router = useRouter();
 
   useEffect(() => {
@@ -113,9 +124,12 @@ export default function WalletConnect() {
         credentials: 'include',
         body: JSON.stringify({ transaction: signedXdr }),
       });
-      const data = await verifyRes.json();
+      const signedXdr = result.signedXdr;
+      toast.info("Verifying cryptographic signature on backend...");
+      const verifyRes = { status: result.status, ok: result.ok };
+      const data = { token: result.token, error: result.error };
 
-      if (verifyRes.status === 403 && data.requiresRegistration) {
+      if (result.requiresRegistration) {
         setTempAddress(userAddress);
         setTempWalletName(selectedWalletName);
         setTempWalletType(selectedWalletType);
@@ -230,7 +244,7 @@ export default function WalletConnect() {
             </svg>
           </div>
 
-          <h3 className="text-2xl font-extrabold text-white tracking-tight">
+          <h3 id="wallet-email-title" className="text-2xl font-extrabold text-white tracking-tight">
             Welcome to TrustPay
           </h3>
 
@@ -324,9 +338,7 @@ export default function WalletConnect() {
           </div>
 
           <div className="flex items-center gap-2 bg-[#18181b] px-3.5 py-2 rounded-xl border border-[#3f3f46] w-full justify-between">
-            <span className="font-mono text-xs text-white tracking-wide truncate">
-              {address.slice(0, 8)}...{address.slice(-8)}
-            </span>
+            <CryptoId value={address} head={8} tail={8} className="text-white truncate" />
             <button
               type="button"
               onClick={copyAddress}

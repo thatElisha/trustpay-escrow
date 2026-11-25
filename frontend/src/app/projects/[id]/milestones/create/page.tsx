@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
+import { CurrencyAmountInput } from '@/components/CurrencyAmountInput';
 import { useMilestonesForm } from '@/hooks/useMilestonesForm';
 import { MilestoneBuilderCanvas, MilestoneItem } from '@/components/MilestoneBuilderCanvas';
 import { useParams } from 'next/navigation';
@@ -60,6 +61,12 @@ export default function CreateMilestonesPage() {
               Drag and drop milestone cards to reorder delivery sequence. Use percentage sliders to
               auto-balance funds so total milestone allocations match 100% of the project budget.
             </p>
+            <Link
+              href={`/projects/create/collaborative?projectId=${encodeURIComponent(projectId)}`}
+              className="mt-4 inline-flex items-center rounded-xl border border-blue-200 bg-white/80 px-4 py-2 text-sm font-semibold text-blue-700 shadow-sm transition hover:border-blue-400 hover:text-blue-800 dark:border-blue-500/30 dark:bg-blue-500/10 dark:text-blue-200 dark:hover:border-blue-400"
+            >
+              Open collaborative scope builder →
+            </Link>
           </div>
 
           <form onSubmit={handleSubmit} className="px-8 py-10 sm:px-12 space-y-8">

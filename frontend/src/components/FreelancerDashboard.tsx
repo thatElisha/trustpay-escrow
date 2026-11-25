@@ -1,25 +1,90 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
+import NumberRoll from './NumberRoll';
 import { toast } from 'sonner';
 import { useRouter } from 'next/navigation';
-import { useWalletStore } from '@/store/walletStore';
+import { useWalletStore, canSubmitProposal, canRaiseDispute } from '@/store/walletStore';
+import { raiseDisputeOnChain } from '@/lib/soroban';
 import { authFetch } from '@/lib/api';
+import { useEscapeKey } from '@/hooks/useEscapeKey';
 
 import { Milestone, Project, Proposal } from '@/types';
 import { ImageLightboxModal } from './ImageLightboxModal';
+import { MilestoneSubmitModal } from './MilestoneSubmitModal';
 import { ProjectChatModal } from './ProjectChatModal';
 import { ProjectCardSkeletonList, ProposalSkeletonList } from '@/components/skeletons';
 import { DownloadReceiptButton } from '@/components/DownloadReceiptButton';
+import { ShareMilestoneButton } from '@/components/ShareableMilestoneCard';
+import { ProjectFilterBar } from '@/components/ProjectFilterBar';
+import { CryptoId } from '@/components/ui/CryptoId';
+import { ProjectActionsDropdown } from '@/components/ProjectActionsDropdown';
+import { ConfirmModal } from '@/components/ConfirmModal';
+import { usePersistentTab, usePersistentFilter } from '@/hooks/usePersistentTab';
+import {
+  CounterOfferSummary,
+  ProposalCounterOfferModal,
+} from '@/components/ProposalCounterOfferModal';
+import type { CounterOffer } from '@/lib/counter-offer';
+import { TaxExportModal } from '@/components/TaxExportModal';
+import { CurrencyConverterWidget } from '@/components/CurrencyConverterWidget';
 
 export function FreelancerDashboard() {
   const router = useRouter();
-  const { address } = useWalletStore();
-  const [activeTab, setActiveTab] = useState<'explore' | 'proposals' | 'jobs'>('explore');
+  const { address, activeRole } = useWalletStore();
+  const [activeTab, setActiveTab] = usePersistentTab<'explore' | 'proposals' | 'jobs'>({
+    key: 'freelancer_active_tab',
+    defaultTab: 'explore',
+    allowedTabs: ['explore', 'proposals', 'jobs'] as const,
+    walletAddress: address,
+  });
   const [loading, setLoading] = useState(true);
+  const [showTaxExport, setShowTaxExport] = useState(false);
   const [projects, setProjects] = useState<Project[]>([]);
   const [proposals, setProposals] = useState<Proposal[]>([]);
   const [lightboxImage, setLightboxImage] = useState<{ url: string; name?: string } | null>(null);
+
+  // Dispute confirmation (ConfirmModal)
+  const [disputeTarget, setDisputeTarget] = useState<Project | null>(null);
+
+  const getDisputeBlockReason = (proj: Project): string | undefined => {
+    if (proj.project_id_onchain === undefined || proj.project_id_onchain === null) {
+      return 'No on-chain escrow to dispute yet';
+    }
+    if (proj.status === 'disputed') return 'A dispute is already open';
+    if (proj.status === 'completed') return 'Completed projects cannot be disputed';
+    if (!canRaiseDispute(proj, address)) return 'Only the client or assigned freelancer can raise a dispute';
+    return undefined;
+  };
+
+  const handleConfirmDispute = async () => {
+    if (!disputeTarget) return;
+    if (!address) {
+      toast.error('Please connect your wallet first.');
+      return;
+    }
+    try {
+      await raiseDisputeOnChain({
+        callerAddress: address,
+        projectIdOnChain: disputeTarget.project_id_onchain as number | string | bigint,
+      });
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+      await authFetch(`${apiUrl}/api/projects/${disputeTarget.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: 'disputed' }),
+      });
+      toast.warning('Dispute raised! Funds are frozen until an arbiter rules.');
+      setDisputeTarget(null);
+      fetchBackendProjects();
+    } catch (err: any) {
+      toast.error(`Dispute failed: ${err?.message || err}`);
+    }
+  };
+
+  // Counter-offer renegotiation (#150)
+  const [reCounterTarget, setReCounterTarget] = useState<Proposal | null>(null);
+  const [counterOfferSubmitting, setCounterOfferSubmitting] = useState(false);
 
   // Chat Modal State
   const [chatModalState, setChatModalState] = useState<{
@@ -48,9 +113,12 @@ export function FreelancerDashboard() {
   // Selected project for Project Details Modal
   const [viewingProjectDetails, setViewingProjectDetails] = useState<Project | null>(null);
 
-  // Search and Category filters
-  const [searchQuery, setSearchQuery] = useState('');
-  const [selectedCategory, setSelectedCategory] = useState<string>('All');
+  // Milestone submission modal state
+  const [submittingMilestone, setSubmittingMilestone] = useState<{ project: Project; milestone: Milestone } | null>(null);
+
+  // Search and Category filters (persisted in sessionStorage)
+  const [searchQuery, setSearchQuery] = usePersistentFilter<string>('freelancer_search', '', address);
+  const [selectedCategory, setSelectedCategory] = usePersistentFilter<string>('freelancer_category', 'All', address);
 
   // Pagination state
   const [currentPage, setCurrentPage] = useState(1);
@@ -59,14 +127,61 @@ export function FreelancerDashboard() {
 
   // Open Apply Modal and pre-fill wallet address
   const handleOpenApplyModal = (proj: Project) => {
+    const check = canSubmitProposal(proj, address, activeRole);
+    if (!check.allowed) {
+      toast.error(check.reason || 'You cannot apply to your own escrow');
+      return;
+    }
     setSelectedProject(proj);
     setProposalWalletAddress(address || '');
     setProposalCoverNote('');
     setProposalPortfolioUrl('');
   };
 
+  // Opens the rich deliverable submission modal for an accepted proposal
+  const handleOpenSubmitModal = (prop: Proposal) => {
+    const targetProject = projects.find((p) => p.id === prop.project_id);
+    const project: Project = targetProject || {
+      id: prop.project_id,
+      title: prop.project_title || 'Freelance Project',
+      description: '',
+      category: 'General',
+      budget: prop.budget,
+      status: 'in_progress',
+      token: 'USDC',
+    };
+    const milestone: Milestone = (project.milestones || []).find(
+      (m) => m.status === 'pending' || m.status === 'in_revision' || m.status === 'submitted'
+    ) || {
+      id: `${prop.id}-milestone-0`,
+      project_id: prop.project_id,
+      milestone_index: 0,
+      title: 'Project Deliverable',
+      description: 'Final deliverable for this engagement',
+      amount: prop.budget,
+      status: 'pending',
+    };
+    setSubmittingMilestone({ project, milestone });
+  };
+
   // Helper to render action button or status badge for a project
   const renderProjectActionBadge = (proj: Project, isModal = false) => {
+    const clientAddr = proj.client_address || (proj as any).client?.stellar_address || (proj as any).client;
+    const isOwnProject = Boolean(clientAddr && address && clientAddr.toLowerCase() === address.toLowerCase());
+    if (isOwnProject) {
+      return (
+        <span
+          data-testid="own-project-badge"
+          className={
+            isModal
+              ? "px-5 py-2.5 bg-[#27272a] text-[#a1a1aa] border border-[#3f3f46] text-xs font-semibold rounded-xl flex items-center gap-1.5 shadow-md cursor-not-allowed"
+              : "px-3.5 py-1.5 bg-[#27272a] text-[#a1a1aa] border border-[#3f3f46] text-xs font-semibold rounded-xl flex items-center gap-1 cursor-not-allowed"
+          }
+        >
+          <span>Owner (Client)</span>
+        </span>
+      );
+    }
     const existingProposal = proposals.find((p) => p.project_id === proj.id) ||
       (proj.applicants || []).find((a: any) => a.stellar_address === address || a.freelancer_address === address) ||
       (proj.proposals || []).find((p: any) => p.freelancer_address === address || p.stellar_address === address);
@@ -94,7 +209,15 @@ export function FreelancerDashboard() {
             >
               <span>💬 Chat with Client</span>
             </button>
+            {proj.milestones?.some((milestone) => milestone.status === 'approved') && (
+              <MilestoneCertificateButton
+                project={proj}
+                milestone={proj.milestones?.find((milestone) => milestone.status === 'approved')}
+                txHash={proj.tx_hash}
+              />
+            )}
             <DownloadReceiptButton project={proj} />
+            <ShareMilestoneButton project={proj} />
             <span className={isModal 
               ? "px-5 py-2.5 bg-[#052e16] text-[#22c55e] border border-[#14532d] text-xs font-bold rounded-xl flex items-center gap-1.5 shadow-md"
               : "px-3.5 py-1.5 bg-[#052e16] text-[#22c55e] border border-[#14532d] text-xs font-bold rounded-xl flex items-center gap-1"
@@ -245,6 +368,8 @@ export function FreelancerDashboard() {
             budget: Number(p.projects?.budget) || 0,
             status: p.status || 'pending',
             created_at: new Date(p.created_at || Date.now()).toISOString().split('T')[0],
+            counter_offer: p.counter_offer || null,
+            negotiation_status: p.negotiation_status || 'none',
           }));
           setProposals(mapped);
         }
@@ -258,6 +383,71 @@ export function FreelancerDashboard() {
     fetchBackendProjects();
     fetchMyProposals();
   }, [address]);
+
+  const handleSubmitCounterOffer = async (offer: CounterOffer) => {
+    if (!reCounterTarget) return;
+    if (!address) throw new Error('Please connect your freelancer wallet first');
+
+    setCounterOfferSubmitting(true);
+    try {
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+      const res = await authFetch(
+        `${apiUrl}/api/proposals/${reCounterTarget.id}/counter-offer`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'counter',
+            milestones: offer.milestones,
+            note: offer.note,
+            actor_address: address,
+          }),
+        }
+      );
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || 'Failed to send counter-offer');
+      }
+      await fetchMyProposals();
+      setReCounterTarget(null);
+    } finally {
+      setCounterOfferSubmitting(false);
+    }
+  };
+
+  const handleRespondToCounterOffer = async (
+    action: 'accept' | 'decline',
+    prop: Proposal
+  ) => {
+    if (!address) {
+      toast.error('Please connect your freelancer wallet first');
+      return;
+    }
+
+    setCounterOfferSubmitting(true);
+    try {
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+      const res = await authFetch(`${apiUrl}/api/proposals/${prop.id}/counter-offer`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, actor_address: address }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `Failed to ${action} counter-offer`);
+      }
+      toast.success(
+        action === 'accept'
+          ? 'Counter-offer accepted — agreed terms are locked into the project.'
+          : 'Counter-offer declined. The original proposal remains active.'
+      );
+      await fetchMyProposals();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Could not update the counter-offer');
+    } finally {
+      setCounterOfferSubmitting(false);
+    }
+  };
 
   // Filtered projects
   const filteredProjects = projects.filter(p => {
@@ -282,6 +472,12 @@ export function FreelancerDashboard() {
     }
 
     if (!selectedProject) return;
+
+    const check = canSubmitProposal(selectedProject, address, activeRole);
+    if (!check.allowed) {
+      toast.error(check.reason || 'You cannot apply to your own escrow');
+      return;
+    }
 
     setIsSubmittingProposal(true);
 
@@ -333,6 +529,9 @@ export function FreelancerDashboard() {
     }
   };
 
+  useEscapeKey(() => setViewingProjectDetails(null), Boolean(viewingProjectDetails));
+  useEscapeKey(() => setSelectedProject(null), Boolean(selectedProject));
+
   return (
     <div className="w-full min-h-screen bg-[#121212] text-[#f4f4f5] font-sans p-3 sm:p-6 md:p-10 transition-colors duration-200">
       <div className="max-w-4xl mx-auto space-y-5 sm:space-y-6">
@@ -354,6 +553,15 @@ export function FreelancerDashboard() {
             </span>
           </div>
 
+          <div className="flex items-center gap-2">
+          <CurrencyConverterWidget portfolioItems={projects.map((p) => ({ amount: p.budget || 0, token: p.token || 'USDC' }))} />
+          <button
+            onClick={() => setShowTaxExport(true)}
+            className="px-3 py-2 rounded-xl text-xs font-semibold bg-[#18181b] border border-[#27272a] text-[#e4e4e7] hover:bg-[#27272a] transition-all"
+            title="Export annual crypto income summary (CSV / PDF)"
+          >
+            🧾 Tax Export
+          </button>
           <div className="flex items-center space-x-1 bg-[#18181b] p-1 rounded-xl border border-[#27272a]">
             <button
               onClick={() => setActiveTab('explore')}
@@ -373,8 +581,9 @@ export function FreelancerDashboard() {
                   : 'text-[#a1a1aa] hover:text-white hover:bg-[#27272a]/50'
               }`}
             >
-              My Proposals ({proposals.length})
+              My Proposals (<NumberRoll value={proposals.length} />)
             </button>
+          </div>
           </div>
         </div>
 
@@ -382,11 +591,38 @@ export function FreelancerDashboard() {
         {activeTab === 'explore' && (
           <div className="bg-[#18181b] border border-[#27272a] rounded-2xl p-4 sm:p-6 md:p-8 shadow-2xl space-y-5 sm:space-y-6">
             
+            {/* Dashboard Statistic Cards with Smooth NumberRoll Counter */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+              <div className="bg-[#121214] border border-[#27272a] rounded-xl p-4">
+                <div className="text-xs text-[#a1a1aa] font-medium">Total Volume</div>
+                <div className="text-xl sm:text-2xl font-black text-white mt-1">
+                  <NumberRoll
+                    value={projects.reduce((sum, p) => sum + (Number(p.budget) || 0), 0)}
+                    prefix="$"
+                    decimals={0}
+                  />
+                </div>
+              </div>
+              <div className="bg-[#121214] border border-[#27272a] rounded-xl p-4">
+                <div className="text-xs text-[#a1a1aa] font-medium">Active Escrows</div>
+                <div className="text-xl sm:text-2xl font-black text-indigo-400 mt-1">
+                  <NumberRoll value={projects.length} />
+                </div>
+              </div>
+              <div className="bg-[#121214] border border-[#27272a] rounded-xl p-4">
+                <div className="text-xs text-[#a1a1aa] font-medium">Submitted Proposals</div>
+                <div className="text-xl sm:text-2xl font-black text-emerald-400 mt-1">
+                  <NumberRoll value={proposals.length} />
+                </div>
+              </div>
+            </div>
+
             {/* Header & Filter Controls */}
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4">
               <div>
-                <h2 className="text-lg sm:text-xl md:text-2xl font-bold tracking-tight text-white">
-                  Available Projects
+                <h2 className="text-lg sm:text-xl md:text-2xl font-bold tracking-tight text-white flex items-center gap-1.5">
+                  <span>Available Projects</span>
+                  <span className="text-xs font-normal text-[#a1a1aa]">(<NumberRoll value={filteredProjects.length} />)</span>
                 </h2>
                 <p className="text-[11px] sm:text-xs md:text-sm text-[#a1a1aa] mt-0.5">
                   Apply for open escrows and submit your milestones.
@@ -394,26 +630,12 @@ export function FreelancerDashboard() {
               </div>
 
               {/* Search & Category Filter */}
-              <div className="flex flex-wrap items-center gap-2">
-                <input
-                  type="text"
-                  placeholder="Search projects..."
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="w-full sm:w-auto px-3 py-1.5 bg-[#232326] border border-[#333338] rounded-xl text-white text-xs placeholder-[#71717a] focus:outline-none focus:border-indigo-500"
-                />
-                <select
-                  value={selectedCategory}
-                  onChange={(e) => setSelectedCategory(e.target.value)}
-                  className="w-full sm:w-auto px-3 py-1.5 bg-[#232326] border border-[#333338] rounded-xl text-white text-xs focus:outline-none focus:border-indigo-500 cursor-pointer"
-                >
-                  <option value="All">All Categories</option>
-                  <option value="Development">Development</option>
-                  <option value="Design">Design</option>
-                  <option value="Writing">Writing</option>
-                  <option value="Marketing">Marketing</option>
-                </select>
-              </div>
+              <ProjectFilterBar
+                searchQuery={searchQuery}
+                onSearchChange={setSearchQuery}
+                selectedCategory={selectedCategory}
+                onCategoryChange={setSelectedCategory}
+              />
             </div>
 
             {/* Project List */}
@@ -458,6 +680,12 @@ export function FreelancerDashboard() {
                           {proj.budget} {proj.token || 'USDC'}
                         </span>
                         {renderProjectActionBadge(proj, false)}
+                        <ProjectActionsDropdown
+                          project={proj}
+                          onView={() => setViewingProjectDetails(proj)}
+                          onDispute={() => setDisputeTarget(proj)}
+                          disputeDisabledReason={getDisputeBlockReason(proj)}
+                        />
                       </div>
                     </div>
 
@@ -625,9 +853,10 @@ export function FreelancerDashboard() {
                       {prop.stellar_address && (
                         <div className="text-xs text-[#a1a1aa] flex items-center space-x-1.5">
                           <span className="text-[#71717a]">Wallet:</span>
-                          <span className="font-mono text-[#e4e4e7] bg-[#232326] px-2 py-0.5 rounded text-[11px] border border-[#333338]">
-                            {prop.stellar_address}
-                          </span>
+                          <CryptoId
+                            value={prop.stellar_address}
+                            className="text-[#e4e4e7] bg-[#232326] px-2 py-0.5 rounded border border-[#333338] break-all"
+                          />
                         </div>
                       )}
 
@@ -649,6 +878,18 @@ export function FreelancerDashboard() {
                             <span>↗</span>
                           </a>
                         </div>
+                      )}
+
+                      {prop.counter_offer && prop.negotiation_status === 'countered' && (
+                        <CounterOfferSummary
+                          offer={prop.counter_offer}
+                          originalBudget={prop.budget}
+                          tokenSymbol={projects.find((p) => p.id === prop.project_id)?.token || 'USDC'}
+                          isSubmitting={counterOfferSubmitting}
+                          onAccept={() => handleRespondToCounterOffer('accept', prop)}
+                          onDecline={() => handleRespondToCounterOffer('decline', prop)}
+                          onRecounter={() => setReCounterTarget(prop)}
+                        />
                       )}
                     </div>
 
@@ -678,6 +919,13 @@ export function FreelancerDashboard() {
                             className="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-xl shadow-md transition-all active:scale-95 flex items-center gap-1.5"
                           >
                             <span>💬 Chat with Client</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleOpenSubmitModal(prop)}
+                            className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-xl shadow-md transition-all active:scale-95"
+                          >
+                            Submit Deliverable
                           </button>
                           <DownloadReceiptButton
                             project={projects.find((p) => p.id === prop.project_id) || {
@@ -711,6 +959,38 @@ export function FreelancerDashboard() {
         )}
 
       </div>
+
+      {/* Counter-offer renegotiation modal (#150) */}
+      <ProposalCounterOfferModal
+        key={reCounterTarget?.id || 'closed-counter-offer'}
+        isOpen={Boolean(reCounterTarget)}
+        author="freelancer"
+        proposal={
+          reCounterTarget
+            ? {
+                id: reCounterTarget.id,
+                project_title: reCounterTarget.project_title,
+                freelancer_address: reCounterTarget.stellar_address,
+                budget: reCounterTarget.budget,
+                counter_offer: reCounterTarget.counter_offer,
+              }
+            : null
+        }
+        originalMilestones={((reCounterTarget
+          ? projects.find((project) => project.id === reCounterTarget.project_id)?.milestones
+          : []) || []).map((milestone) => ({
+          milestone_index: milestone.milestone_index,
+          title: milestone.title,
+          amount: milestone.amount,
+          due_date: milestone.due_date,
+        }))}
+        tokenSymbol={
+          projects.find((project) => project.id === reCounterTarget?.project_id)?.token || 'USDC'
+        }
+        isSubmitting={counterOfferSubmitting}
+        onClose={() => setReCounterTarget(null)}
+        onSubmit={handleSubmitCounterOffer}
+      />
 
       {/* Project Details Modal */}
       {viewingProjectDetails && (
@@ -917,7 +1197,7 @@ export function FreelancerDashboard() {
                   placeholder="e.g. GAUBK... (Your Stellar Public Key)"
                   disabled
                   readOnly
-                  className="w-full px-3.5 py-2.5 bg-[#1c1c20] border border-[#27272a] rounded-xl text-[#a1a1aa] font-mono text-xs cursor-not-allowed opacity-80 focus:outline-none"
+                  className="w-full px-3.5 py-2.5 bg-[#1c1c20] border border-[#27272a] rounded-xl text-[#a1a1aa] font-mono tracking-tight text-xs cursor-not-allowed opacity-80 focus:outline-none"
                   required
                 />
                 {address && (
@@ -1000,6 +1280,28 @@ export function FreelancerDashboard() {
         receiverAddress={chatModalState.receiverAddress}
         recipientRoleLabel={chatModalState.recipientRoleLabel}
       />
+
+      {/* Annual tax / 1099 crypto income export (#161) */}
+      <TaxExportModal
+        isOpen={showTaxExport}
+        onClose={() => setShowTaxExport(false)}
+        freelancerAddress={address}
+      />
+
+      {/* Rich Milestone Deliverable Submission Modal */}
+      {submittingMilestone && (
+        <MilestoneSubmitModal
+          isOpen={Boolean(submittingMilestone)}
+          onClose={() => setSubmittingMilestone(null)}
+          project={submittingMilestone.project}
+          milestone={submittingMilestone.milestone}
+          onSubmitted={() => {
+            setSubmittingMilestone(null);
+            fetchBackendProjects();
+            fetchMyProposals();
+          }}
+        />
+      )}
     </div>
   );
 }

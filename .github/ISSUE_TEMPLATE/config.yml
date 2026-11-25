@@ -4,5 +4,5 @@ contact_links:
     url: https://github.com/OluwapelumiElisha/trustpay-escrow/discussions
     about: Ask questions, share ideas, or discuss implementation details with maintainers.
   - name: Security Vulnerability Disclosure
-    url: mailto:security@trustpay.network
-    about: Privately disclose sensitive security vulnerabilities.
+    url: https://github.com/OluwapelumiElisha
+    about: Privately contact the maintainer via GitHub DM until Private Vulnerability Reporting is enabled.
